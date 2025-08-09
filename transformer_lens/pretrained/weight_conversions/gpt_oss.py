@@ -131,7 +131,7 @@ def _split_mlp1_concat(
   return gate, up
 
 
-def convert_gpt_oss_weights(gpt_oss: torch.nn.Module, cfg: HookedTransformerConfig) -> Dict[str, torch.Tensor]:
+def convert_gpt_oss_weights(gpt_oss: torch.nn.Module, cfg: HookedTransformerConfig) -> dict[str, torch.Tensor]:
   """Convert GPT-OSS (20B/120B) HF model weights to TransformerLens format.
 
   This mirrors llama/mixtral mapping, with MoE & optional GQA. Sinks are a per-head
@@ -183,21 +183,52 @@ def convert_gpt_oss_weights(gpt_oss: torch.nn.Module, cfg: HookedTransformerConf
     state_dict[f"blocks.{l}.ln2.w"] = layer.post_attention_layernorm.weight
 
     if moe and cfg.num_experts is not None:
-      # Router
-      state_dict[f"blocks.{l}.mlp.W_gate.weight"] = layer.mlp.router.weight
-      # Experts
-      for e in range(cfg.num_experts):
-        expert = layer.mlp.experts[e]
-        # Mapping w3->W_in, w1->W_gate, w2->W_out (same as Mixtral & docstring)
-        state_dict[f"blocks.{l}.mlp.experts.{e}.W_in.weight"] = _maybe_dequant_mxfp4(
-          expert.w3.weight
-        )
-        state_dict[f"blocks.{l}.mlp.experts.{e}.W_gate.weight"] = _maybe_dequant_mxfp4(
-          expert.w1.weight
-        )
-        state_dict[f"blocks.{l}.mlp.experts.{e}.W_out.weight"] = _maybe_dequant_mxfp4(
-          expert.w2.weight
-        )
+      assert isinstance(cfg.num_experts, int)
+      num_experts = cfg.num_experts
+      # Router may be named 'router' or 'gate' depending on implementation
+      router_mod = getattr(layer.mlp, "router", None)  # type: ignore[attr-defined]
+      if router_mod is None:
+        router_mod = getattr(layer.mlp, "gate", None)  # type: ignore[attr-defined]
+      if router_mod is None:
+        raise AttributeError("Could not find router/gate module on layer.mlp (expected 'router' or 'gate').")
+      router_w = router_mod.weight
+      if router_w.shape == (num_experts, cfg.d_model):  # transpose to (d_model, num_experts)
+        router_w = router_w.T
+      if router_w.shape != (cfg.d_model, num_experts):
+        raise ValueError(f"Unexpected router weight shape {router_w.shape}")
+      state_dict[f"blocks.{l}.mlp.W_gate.weight"] = router_w
+
+      # Experts container: ModuleList or packed experts module
+      experts_container = getattr(layer.mlp, "experts", None)  # type: ignore[attr-defined]
+      if experts_container is None:
+        raise AttributeError("layer.mlp missing 'experts' for MoE mapping")
+
+      if isinstance(experts_container, torch.nn.Module) and hasattr(experts_container, "gate_up_proj"):
+        gup = experts_container.gate_up_proj  # (E, d_model, 2*d_mlp)
+        gup_bias = getattr(experts_container, "gate_up_proj_bias", None)
+        down = experts_container.down_proj    # (E, d_mlp, d_model)
+        down_bias = getattr(experts_container, "down_proj_bias", None)
+        if gup.shape[0] != num_experts:
+          raise ValueError("gate_up_proj first dim mismatch")
+        # Interleaved even/odd for (gate, up)
+        gate_w = gup[..., ::2]
+        up_w = gup[..., 1::2]
+        for e in range(num_experts):
+          state_dict[f"blocks.{l}.mlp.experts.{e}.W_in.weight"] = _maybe_dequant_mxfp4(up_w[e].transpose(0, 1))
+          state_dict[f"blocks.{l}.mlp.experts.{e}.W_gate.weight"] = _maybe_dequant_mxfp4(gate_w[e].transpose(0, 1))
+          state_dict[f"blocks.{l}.mlp.experts.{e}.W_out.weight"] = _maybe_dequant_mxfp4(down[e])
+          if gup_bias is not None:
+            state_dict[f"blocks.{l}.mlp.experts.{e}.b_gate"] = gup_bias[e][::2]
+            state_dict[f"blocks.{l}.mlp.experts.{e}.b_in"] = gup_bias[e][1::2]
+          if down_bias is not None:
+            state_dict[f"blocks.{l}.mlp.experts.{e}.b_out"] = down_bias[e]
+      else:
+        # Iterable experts
+        for e in range(num_experts):
+          expert = experts_container[e]  # type: ignore[index]
+          state_dict[f"blocks.{l}.mlp.experts.{e}.W_in.weight"] = _maybe_dequant_mxfp4(expert.w3.weight)
+          state_dict[f"blocks.{l}.mlp.experts.{e}.W_gate.weight"] = _maybe_dequant_mxfp4(expert.w1.weight)
+          state_dict[f"blocks.{l}.mlp.experts.{e}.W_out.weight"] = _maybe_dequant_mxfp4(expert.w2.weight)
     else:
       # Standard MLP (should not happen for GPT-OSS, but safeguard)
       state_dict[f"blocks.{l}.mlp.W_in"] = layer.mlp.up_proj.weight.T
@@ -215,11 +246,11 @@ def convert_gpt_oss_weights(gpt_oss: torch.nn.Module, cfg: HookedTransformerConf
 
 # ------------------------ Original Checkpoint Direct Conversion -----------------------
 def convert_gpt_oss_original_checkpoint(
-    checkpoint_dir: str,
-    *,
-    restrict_layers: Optional[Sequence[int]] = None,
-    dequant_mode: str = "linear",
-) -> Tuple[HookedTransformerConfig, Dict[str, torch.Tensor]]:
+  checkpoint_dir: str,
+  *,
+  restrict_layers: Sequence[int] | None = None,
+  dequant_mode: str = "linear",
+) -> tuple[HookedTransformerConfig, dict[str, torch.Tensor]]:
   """Convert a raw downloaded GPT-OSS original checkpoint (single safetensors file) into
   a TransformerLens config & state_dict.
 
@@ -280,7 +311,7 @@ def convert_gpt_oss_original_checkpoint(
   )
 
   # Prepare state dict
-  state: Dict[str, torch.Tensor] = {}
+  state: dict[str, torch.Tensor] = {}
 
   with safe_open(weights_path, framework="pt") as f:
     # Embedding
@@ -289,7 +320,7 @@ def convert_gpt_oss_original_checkpoint(
 
     # Iterate layers
     layer_indices = range(n_layers) if restrict_layers is None else restrict_layers
-    layer_set = set(layer_indices)
+  # simply iterate selected layers
     for l in layer_indices:
       prefix = f"block.{l}."
       # Norms
