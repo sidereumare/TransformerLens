@@ -127,6 +127,14 @@ class AbstractAttention(ABC, nn.Module):
         self.hook_pattern = HookPoint()  # [batch, head_index, query_pos, key_pos]
         self.hook_result = HookPoint()  # [batch, pos, head_index, d_model]
 
+        # Optional learned attention sinks (GPT-OSS style): one extra logit per head.
+        if getattr(self.cfg, "use_attention_sinks", False):
+            self.attn_sinks = nn.Parameter(
+                torch.zeros(self.cfg.n_heads, dtype=self.cfg.dtype)
+            )
+        else:
+            self.attn_sinks = None
+
         # See HookedTransformerConfig for more details.
         if self.cfg.positional_embedding_type == "shortformer":
             # This tracks the input to the keys and queries, which is resid_pre + pos_embeds
@@ -270,7 +278,28 @@ class AbstractAttention(ABC, nn.Module):
             attn_scores += additive_attention_mask
 
         attn_scores = self.hook_attn_scores(attn_scores)
-        pattern = F.softmax(attn_scores, dim=-1)
+        if self.attn_sinks is not None:
+            # Append per-head sink logit (broadcast across batch & query positions)
+            sink_logits = self.attn_sinks.view(1, self.cfg.n_heads, 1, 1).to(attn_scores.dtype)
+            attn_scores = torch.cat(
+                [
+                    attn_scores,
+                    sink_logits.expand(
+                        attn_scores.shape[0], -1, attn_scores.shape[2], 1
+                    ),
+                ],
+                dim=-1,
+            )
+            pattern_full = F.softmax(attn_scores, dim=-1)
+            sink_prob = pattern_full[..., -1:]
+            pattern = pattern_full[..., :-1]
+            # Renormalize over real keys so probabilities sum to 1
+            denom = (1 - sink_prob).clamp(min=1e-9)
+            pattern = pattern / denom
+            # Store sink probability for potential analysis
+            self.last_sink_prob = sink_prob.detach()
+        else:
+            pattern = F.softmax(attn_scores, dim=-1)
         pattern = torch.where(torch.isnan(pattern), torch.zeros_like(pattern), pattern)
         pattern = self.hook_pattern(pattern)  # [batch, head_index, query_pos, key_pos]
         pattern = pattern.to(self.cfg.dtype)
@@ -558,7 +587,40 @@ class AbstractAttention(ABC, nn.Module):
             inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
             freq = 1 / inv_freq_llama
         else:
-            freq = base ** (dim / (rotary_dim / 2))
+            # Support YARN-style scaling if rope_scaling dict provided with rope_type == 'yarn'
+            if (
+                hasattr(self.cfg, "rope_scaling")
+                and self.cfg.rope_scaling is not None
+                and isinstance(self.cfg.rope_scaling, dict)
+                and self.cfg.rope_scaling.get("rope_type", "") == "yarn"
+            ):
+                # Reference: https://arxiv.org/abs/2309.00071 (YaRN). We approximate implementation from gpt-oss.
+                scaling_factor = float(self.cfg.rope_scaling.get("factor", 1.0))
+                beta_fast = float(self.cfg.rope_scaling.get("beta_fast", 32.0))
+                beta_slow = float(self.cfg.rope_scaling.get("beta_slow", 1.0))
+                orig_ctx = int(
+                    self.cfg.rope_scaling.get(
+                        "original_max_position_embeddings", self.cfg.n_ctx // max(1, int(scaling_factor))
+                    )
+                )
+                # Following gpt-oss logic: compute low/high thresholds for interpolation/extrapolation
+                d_half = rotary_dim / 2
+                # Avoid log(0)
+                base_log = math.log(base)
+                low = d_half * math.log(orig_ctx / (beta_fast * 2 * math.pi)) / base_log
+                high = d_half * math.log(orig_ctx / (beta_slow * 2 * math.pi)) / base_log
+                low = max(1.0, min(low, d_half - 2))
+                high = max(low + 1.0, min(high, d_half - 1))
+                freq = base ** (dim / (rotary_dim / 2))
+                if scaling_factor > 1.0:
+                    inv_freq_interp = 1.0 / (scaling_factor * freq)
+                    inv_freq_extrap = 1.0 / freq
+                    ramp = (dim - low) / (high - low)
+                    mask = 1 - torch.clamp(ramp, 0, 1)
+                    inv_freq = inv_freq_interp * (1 - mask) + inv_freq_extrap * mask
+                    freq = 1 / inv_freq
+            else:
+                freq = base ** (dim / (rotary_dim / 2))
         if self.cfg.rotary_adjacent_pairs:
             freq = einops.repeat(freq, "d -> (d 2)")
         else:

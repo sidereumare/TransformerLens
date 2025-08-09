@@ -29,6 +29,8 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_coder_weights,
     convert_gemma_weights,
     convert_gpt2_weights,
+    convert_gpt_oss_original_checkpoint,
+    convert_gpt_oss_weights,
     convert_gptj_weights,
     convert_llama_weights,
     convert_mingpt_weights,
@@ -780,9 +782,63 @@ def convert_hf_model_config(model_name: str, **kwargs: Any):
 
     Takes the official_model_name as an input.
     """
-    # In case the user passed in an alias
-    if (Path(model_name) / "config.json").exists():
+    # In case the user passed in an alias or a raw local directory (eg original GPT-OSS)
+    local_config_path = Path(model_name) / "config.json"
+    original_gpt_oss_local = False
+    if local_config_path.exists():
         logging.info("Loading model config from local directory")
+        # Detect original (non-HF) GPT-OSS style config (distributed with single model.safetensors)
+        try:
+            import json
+            with open(local_config_path, "r", encoding="utf-8") as f:
+                raw_local_cfg = json.load(f)
+            if (
+                all(k in raw_local_cfg for k in ["num_hidden_layers", "hidden_size", "head_dim", "num_attention_heads", "intermediate_size", "num_experts", "experts_per_token"]) 
+                and "architectures" not in raw_local_cfg
+            ):
+                original_gpt_oss_local = True
+                logging.info("Detected original GPT-OSS checkpoint config format (non-HF).");
+                # Build cfg_dict mirroring convert_gpt_oss_original_checkpoint
+                n_layers = int(raw_local_cfg["num_hidden_layers"])
+                n_heads = int(raw_local_cfg["num_attention_heads"])
+                n_kv = int(raw_local_cfg.get("num_key_value_heads", n_heads))
+                d_model = int(raw_local_cfg["hidden_size"])
+                d_head = int(raw_local_cfg["head_dim"])
+                d_vocab = int(raw_local_cfg.get("vocab_size", 50257))
+                d_mlp = int(raw_local_cfg["intermediate_size"])
+                num_experts = int(raw_local_cfg["num_experts"])
+                experts_per_token = int(raw_local_cfg["experts_per_token"])
+                rope_theta = raw_local_cfg.get("rope_theta", 10000)
+                rope_scaling_factor = raw_local_cfg.get("rope_scaling_factor", None)
+                rope_ntk_alpha = raw_local_cfg.get("rope_ntk_alpha", None)
+                rope_ntk_beta = raw_local_cfg.get("rope_ntk_beta", None)
+                cfg_dict = {
+                    "dtype": torch.bfloat16,
+                    "d_model": d_model,
+                    "d_head": d_head,
+                    "n_heads": n_heads,
+                    "d_mlp": d_mlp,
+                    "n_layers": n_layers,
+                    "n_ctx": raw_local_cfg.get("initial_context_length", 4096),
+                    "d_vocab": d_vocab,
+                    "act_fn": "silu",
+                    "positional_embedding_type": "rotary",
+                    "rotary_base": rope_theta,
+                    "n_key_value_heads": (n_kv if n_kv != n_heads else None),
+                    "num_experts": num_experts,
+                    "experts_per_token": experts_per_token,
+                    "use_attention_sinks": True,
+                    "normalization_type": "RMS",
+                    "rope_scaling": {
+                        "factor": rope_scaling_factor,
+                        "ntk_alpha": rope_ntk_alpha,
+                        "ntk_beta": rope_ntk_beta,
+                    },
+                    "original_architecture": "GptOssForCausalLM",
+                }
+                return cfg_dict
+        except Exception as e:  # pragma: no cover - robustness
+            logging.warning(f"Failed to parse local config.json for original GPT-OSS detection: {e}")
         official_model_name = model_name
     else:
         official_model_name = get_official_model_name(model_name)
@@ -1241,6 +1297,48 @@ def convert_hf_model_config(model_name: str, **kwargs: Any):
             "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
             "num_experts": hf_config.num_local_experts,
             "experts_per_token": hf_config.num_experts_per_tok,
+        }
+    elif architecture == "GptOssForCausalLM":
+        # Map gpt-oss (20B / 120B) configs. Supports alternating sliding/full attention and MoE.
+        layer_types = getattr(hf_config, "layer_types", None)
+        attn_types = None
+        use_local_attn = False
+        if layer_types is not None:
+            attn_types = ["local" if lt == "sliding_attention" else "global" for lt in layer_types]
+            use_local_attn = any(t == "local" for t in attn_types)
+        # head_dim may already be provided (hf_config.head_dim) but in spec it's head_dim
+        d_head = (
+            hf_config.head_dim
+            if hasattr(hf_config, "head_dim") and hf_config.head_dim is not None and hf_config.head_dim > 0
+            else hf_config.hidden_size // hf_config.num_attention_heads
+        )
+        cfg_dict = {
+            "dtype": torch.bfloat16,
+            "d_model": hf_config.hidden_size,
+            "d_head": d_head,
+            "n_heads": hf_config.num_attention_heads,
+            "d_mlp": hf_config.intermediate_size,
+            "n_layers": hf_config.num_hidden_layers,
+            "n_ctx": hf_config.max_position_embeddings,
+            "d_vocab": hf_config.vocab_size,
+            "act_fn": hf_config.hidden_act,
+            "eps": hf_config.rms_norm_eps if hasattr(hf_config, "rms_norm_eps") else hf_config.layer_norm_eps,
+            "window_size": getattr(hf_config, "sliding_window", None),
+            "attn_types": attn_types,
+            "use_local_attn": use_local_attn,
+            "normalization_type": "RMS",
+            "positional_embedding_type": "rotary",
+            "rotary_base": getattr(hf_config, "rope_theta", 10000),
+            "n_key_value_heads": (
+                hf_config.num_key_value_heads
+                if hf_config.num_key_value_heads != hf_config.num_attention_heads
+                else None
+            ),
+            "num_experts": getattr(hf_config, "num_local_experts", None),
+            "experts_per_token": getattr(hf_config, "num_experts_per_tok", None),
+            "gated_mlp": False,  # MoE replaces standard MLP; not using gated GELU variant
+            "rope_scaling": getattr(hf_config, "rope_scaling", None),
+            "use_attention_sinks": True,
         }
     elif architecture == "BloomForCausalLM":
         cfg_dict = {
@@ -1863,6 +1961,25 @@ def get_pretrained_state_dict(
         logging.info(f"Loading model from local path {official_model_name}")
     else:
         official_model_name = get_official_model_name(official_model_name)
+    # Early exit: original GPT-OSS directory (model.safetensors present) -> direct conversion
+    # We rely on earlier config detection having set original_architecture appropriately.
+    if (
+        Path(official_model_name).is_dir()
+        and (Path(official_model_name) / "model.safetensors").exists()
+        and cfg.original_architecture == "GptOssForCausalLM"
+    ):
+        try:
+            restrict_layers = kwargs.pop("gpt_oss_restrict_layers", None)
+            _, state_direct = convert_gpt_oss_original_checkpoint(
+                official_model_name,
+                restrict_layers=restrict_layers,
+                dequant_mode=os.environ.get("GPT_OSS_DEQUANT_MODE", "linear"),
+            )
+            return state_direct
+        except Exception as e:  # pragma: no cover
+            logging.warning(
+                f"Attempted original GPT-OSS direct conversion but failed ({e}); falling back to HF pathway if available."
+            )
     if official_model_name.startswith(NEED_REMOTE_CODE_MODELS) and not kwargs.get(
         "trust_remote_code", False
     ):
@@ -1968,6 +2085,8 @@ def get_pretrained_state_dict(
             state_dict = convert_mistral_weights(hf_model, cfg)
         elif cfg.original_architecture == "MixtralForCausalLM":
             state_dict = convert_mixtral_weights(hf_model, cfg)
+        elif cfg.original_architecture == "GptOssForCausalLM":
+            state_dict = convert_gpt_oss_weights(hf_model, cfg)
         elif cfg.original_architecture == "BloomForCausalLM":
             state_dict = convert_bloom_weights(hf_model, cfg)
         elif cfg.original_architecture == "GPT2LMHeadCustomModel":

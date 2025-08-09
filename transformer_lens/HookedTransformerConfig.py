@@ -249,6 +249,9 @@ class HookedTransformerConfig:
     rotary_base: int = 10000
     trust_remote_code: bool = False
     rotary_adjacent_pairs: bool = False
+    # Raw rope scaling dict (e.g., YARN parameters) passed through from HF configs.
+    # Currently informational; rotary generation logic will ignore unless specific support added.
+    rope_scaling: Optional[Dict[str, Union[int, float, bool, str]]] = None
     load_in_4bit: bool = False
     num_experts: Optional[int] = None
     experts_per_token: Optional[int] = None
@@ -264,6 +267,8 @@ class HookedTransformerConfig:
     NTK_by_parts_high_freq_factor: float = 4.0
     NTK_by_parts_factor: float = 8.0
     NTK_original_ctx_len: int = 8192
+    # Whether to use learned attention sinks (extra per-head logit appended to attention scores, GPT-OSS style)
+    use_attention_sinks: bool = False
 
     def __post_init__(self):
         if self.n_heads == -1:
